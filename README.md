@@ -6,7 +6,7 @@ TileMix is an inference-time attention kernel for long-context LLMs. It treats *
   <img src="assets/framework.png" width="100%" alt="TileMix framework">
 </p>
 
-This repository contains the implementation accompanying **“TileMix: Tile-Centric Mixed-Precision Attention for LLM Inference Acceleration.”** The released code includes the Triton attention kernels, routing-map construction, and Hugging Face integrations for LLaMA- and Qwen2-family models.
+This repository contains the implementation accompanying **“TileMix: Tile-Centric Mixed-Precision Attention for LLM Inference Acceleration.”** The released code includes the Triton attention kernels, routing-map construction, and Hugging Face integrations for LLaMA- and Qwen-family models.
 
 ## Usage
 
@@ -37,7 +37,7 @@ model = configure_tilemix_attention_pattern(
 )
 ```
 
-### Qwen2
+### Qwen
 
 ```bash
 python examples/apply_tilemix_qwen.py \

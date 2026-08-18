@@ -1,9 +1,0 @@
-__pycache__/
-*.py[cod]
-.venv/
-.env
-.cache/
-*.pt
-*.pth
-*.npy
-*.npz
