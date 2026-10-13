@@ -1,106 +1,22 @@
-#!/usr/bin/env python
-
 import torch
 import random
-
-"""
-precision_maps.py
-
-This module defines utilities to construct token-level sparse-attention
-patterns and convert them into BLOCK-level precision maps or packed
-bitmasks used by TileMix attention.
-
-Semantics:
-
-    - All sparse attention patterns are defined in TOKEN space
-      with shape [num_layer, num_head, Q, K].
-
-    - Mask value convention:
-          0 / False  -> high precision (FP16)
-          1 / True   -> low precision (INT8)
-
-    - Precision map / bitmask operate in BLOCK space:
-          BLOCK_M = query block size
-          BLOCK_N = key block size
-      Each block is reduced to a single boolean indicating whether
-      the block contains any FP16 tokens.
-
-Design Rules:
-
-    • Patterns such as `one`, `zero`, `causal` are FIXED SHAPE
-      and MUST NOT be modified by `percentage`.
-
-    • Patterns such as `band`, `bigbird`, `sptrans`, `row_rand`
-      MAY be controlled by `percentage`.
-
-    • Packed bitmask encodes INT8 blocks as bit=1.
-      (i.e., same True = not important convention)
-
-    • num_n <= 64 because precision bitmask is stored in uint64.
-"""
-
 
 
 def gen_one_pattern(num_query, num_key,
                     dtype: torch.dtype = torch.bool,
                     num_layer: int = 1, num_head: int = 1) -> torch.Tensor:
-    """
-    Fully-not-important pattern.
-
-    Returns a tensor where ALL positions are marked as NOT important:
-        value = 1 (True)
-
-    Shape: [num_layer, num_head, Q, K]
-
-    Example (4x4):
-        [[1, 1, 1, 1],
-         [1, 1, 1, 1],
-         [1, 1, 1, 1],
-         [1, 1, 1, 1]]
-    """
     return torch.ones((num_layer, num_head, num_query, num_key), dtype=dtype)
 
 
 def gen_zero_pattern(num_query, num_key,
                      dtype: torch.dtype = torch.bool,
                      num_layer: int = 1, num_head: int = 1) -> torch.Tensor:
-    """
-    Fully-important pattern.
-
-    Returns a tensor where all positions are marked high precision:
-        value = 0 (False)
-
-    Shape: [num_layer, num_head, Q, K]
-
-    All tokens use high precision (FP16).
-
-    Example (4x4):
-        [[0, 0, 0, 0],
-         [0, 0, 0, 0],
-         [0, 0, 0, 0],
-         [0, 0, 0, 0]]
-    """
     return torch.zeros((num_layer, num_head, num_query, num_key), dtype=dtype)
 
 
 def gen_causal_pattern(num_query, num_key,
                        dtype: torch.dtype = torch.bool,
                        num_layer: int = 1, num_head: int = 1) -> torch.Tensor:
-    """
-    Causal attention pattern.
-
-    Marks positions where k_idx > q_idx as NOT important (INT8).
-    Upper triangular region (future tokens) uses low precision.
-
-    Shape: [num_layer, num_head, Q, K]
-
-    Example (4x4):
-        [[0, 1, 1, 1],
-         [0, 0, 1, 1],
-         [0, 0, 0, 1],
-         [0, 0, 0, 0]]
-    (0 = FP16, 1 = INT8)
-    """
     q_idx = torch.arange(num_query).unsqueeze(1)
     k_idx = torch.arange(num_key).unsqueeze(0)
     mask2d = (k_idx > q_idx)
@@ -110,53 +26,39 @@ def gen_causal_pattern(num_query, num_key,
 
 
 def calculate_band_width_from_percentage(
-    seq_len: int, 
+    seq_len: int,
     percentage: float,
     block_n: int
 ) -> int:
-    """
-    Compute band width in tokens from target percentage of low-precision blocks.
-
-    Args:
-        seq_len: Sequence length in tokens.
-        percentage: Target fraction of blocks using INT8 (0.0-1.0).
-        block_n: Key block size for block-level calculation.
-
-    Returns:
-        Band width in tokens (odd integer, >= 3).
-
-    The band width is adjusted to achieve the target percentage while
-    maintaining odd width for symmetric patterns.
-    """
     if percentage is None or percentage <= 0.0 or percentage >= 1.0:
         return 5
-    
+
     if block_n is None or block_n <= 0:
         target_band_ratio = 1.0 - percentage
         estimated_band_width = int(target_band_ratio * seq_len)
         if estimated_band_width % 2 == 0:
             estimated_band_width += 1
         return max(3, min(estimated_band_width, seq_len))
-    
+
     num_n = (seq_len + block_n - 1) // block_n
     target_band_ratio = 1.0 - percentage
     target_band_blocks = target_band_ratio * num_n
-    
+
     band_blocks = int(round(target_band_blocks))
     if band_blocks % 2 == 0:
         if target_band_blocks > band_blocks:
             band_blocks += 1
         else:
             band_blocks = max(1, band_blocks - 1)
-    
+
     band_blocks = max(1, min(band_blocks, num_n))
     band_width = band_blocks * block_n
-    
+
     if band_width % 2 == 0:
         band_width += 1
-    
+
     band_width = max(3, min(band_width, seq_len))
-    
+
     return band_width
 
 
@@ -165,40 +67,16 @@ def gen_band_pattern(num_query, num_key, band_width: int = None,
                      num_layer: int = 1, num_head: int = 1,
                      percentage: float = None,
                      block_n: int = None) -> torch.Tensor:
-    """
-    Band attention pattern (local attention window).
-
-    Creates a diagonal band where each query attends to a local window
-    of keys. Positions outside the band are marked as NOT important (INT8).
-
-    Args:
-        num_query: Number of query tokens.
-        num_key: Number of key tokens.
-        band_width: Width of the band in tokens (must be odd).
-        percentage: Alternative to band_width: target INT8 percentage.
-        block_n: Block size for percentage-based calculation.
-
-    Returns:
-        Mask tensor of shape [num_layer, num_head, Q, K].
-        True = INT8 (not important), False = FP16 (important).
-
-    Example (4x4, band_width=3):
-        [[0, 0, 1, 1],
-         [0, 0, 0, 1],
-         [1, 0, 0, 0],
-         [1, 1, 0, 0]]
-    (0 = FP16, 1 = INT8)
-    """
     if band_width is None and percentage is not None:
         band_width = calculate_band_width_from_percentage(num_query, percentage, block_n)
-    
+
     if band_width is None:
         band_width = 5
-    
+
     if band_width % 2 == 0:
         band_width += 1
     band_width = min(band_width, num_key)
-    
+
     q = torch.arange(num_query)
     k = torch.arange(num_key)
     start = q[:, None] - band_width // 2
@@ -210,28 +88,6 @@ def gen_band_pattern(num_query, num_key, band_width: int = None,
 def gen_global_pattern(num_query, num_key, key_pos: list,
                        dtype: torch.dtype = torch.bool,
                        num_layer: int = 1, num_head: int = 1) -> torch.Tensor:
-    """
-    Global attention pattern.
-
-    All queries attend to specified global key positions with high precision.
-    Other positions use low precision (INT8).
-
-    Args:
-        num_query: Number of query tokens.
-        num_key: Number of key tokens.
-        key_pos: List of key positions to attend globally (e.g., [0, 1, 2]).
-
-    Returns:
-        Mask tensor of shape [num_layer, num_head, Q, K].
-        True = INT8, False = FP16.
-
-    Example (4x4, key_pos=[0, 1]):
-        [[0, 0, 1, 1],
-         [0, 0, 1, 1],
-         [0, 0, 1, 1],
-         [0, 0, 1, 1]]
-    (0 = FP16, 1 = INT8)
-    """
     valid_key_pos = [pos for pos in key_pos if pos < num_key]
 
     g = torch.zeros(
@@ -250,28 +106,6 @@ def gen_global_pattern(num_query, num_key, key_pos: list,
 def gen_row_rand_pattern(num_query, num_key, num_rand_block_per_row: int,
                          dtype: torch.dtype = torch.bool,
                          num_layer: int = 1, num_head: int = 1) -> torch.Tensor:
-    """
-    Random attention pattern per row.
-
-    Each query row randomly selects num_rand_block_per_row key positions
-    for high precision. Remaining positions use INT8.
-
-    Args:
-        num_query: Number of query tokens.
-        num_key: Number of key tokens.
-        num_rand_block_per_row: Number of random key positions per query.
-
-    Returns:
-        Mask tensor of shape [num_layer, num_head, Q, K].
-        True = INT8, False = FP16.
-
-    Example (4x4, num_rand_block_per_row=2, seed=42):
-        [[0, 1, 0, 1],
-         [1, 0, 1, 0],
-         [0, 1, 0, 1],
-         [1, 0, 1, 0]]
-    (0 = FP16, 1 = INT8; positions vary by random seed)
-    """
     rand = torch.zeros(
         (num_layer,
          num_head,
@@ -289,29 +123,6 @@ def gen_row_rand_pattern(num_query, num_key, num_rand_block_per_row: int,
 def gen_align_sparse_pattern(num_query, num_key, alpha: int, beta: float,
                              dtype: torch.dtype = torch.bool,
                              num_layer: int = 1, num_head: int = 1) -> torch.Tensor:
-    """
-    Aligned sparse attention pattern.
-
-    Each query i attends to a variable number of keys starting from
-    position (i - nnz + 1), where nnz grows with query index.
-
-    Args:
-        num_query: Number of query tokens.
-        num_key: Number of key tokens.
-        alpha: Base number of attended keys.
-        beta: Growth factor for attended keys.
-
-    Returns:
-        Mask tensor of shape [num_layer, num_head, Q, K].
-        True = INT8, False = FP16.
-
-    Example (4x4, alpha=2, beta=0.1):
-        [[0, 0, 1, 1],
-         [0, 0, 0, 1],
-         [1, 0, 0, 0],
-         [1, 1, 0, 0]]
-    (0 = FP16, 1 = INT8; pattern grows from right)
-    """
     pat = torch.zeros(
         (num_layer,
          num_head,
@@ -334,35 +145,6 @@ def gen_bigbird_pattern(num_query, num_key,
                         num_rand_block: int = 3,
                         dtype: torch.dtype = torch.bool,
                         num_layer: int = 1, num_head: int = 1) -> torch.Tensor:
-    """
-    BigBird attention pattern.
-
-    Combines three components:
-    1. Band pattern: local attention window.
-    2. Global pattern: all queries attend to first num_global_block keys.
-    3. Random pattern: random key positions per query.
-
-    Positions covered by any component use high precision (FP16).
-    Others use INT8.
-
-    Args:
-        num_query: Number of query tokens.
-        num_key: Number of key tokens.
-        num_band_block: Band width in blocks.
-        num_global_block: Number of global key positions.
-        num_rand_block: Number of random positions per query.
-
-    Returns:
-        Mask tensor of shape [num_layer, num_head, Q, K].
-        True = INT8, False = FP16.
-
-    Example (4x4, num_band_block=3, num_global_block=2, num_rand_block=1):
-        [[0, 0, 0, 1],
-         [0, 0, 0, 1],
-         [1, 0, 0, 0],
-         [1, 1, 0, 0]]
-    (0 = FP16 from band/global/random, 1 = INT8)
-    """
     band = gen_band_pattern(
         num_query,
         num_key,
@@ -396,16 +178,6 @@ def gen_bigbird_pattern(num_query, num_key,
 
 def gen_block_pattern(layout: torch.Tensor, block_size: int = 64,
                       dtype: torch.dtype = torch.bool) -> torch.Tensor:
-    """
-    Expand block-level layout to token-level pattern.
-
-    Args:
-        layout: Block-level mask [L, H, QB, KB] or [QB, KB].
-        block_size: Number of tokens per block.
-
-    Returns:
-        Token-level mask [L, H, QB*block_size, KB*block_size].
-    """
     if layout.ndim == 2:
         layout = layout.unsqueeze(0).unsqueeze(0)
     if layout.ndim == 3:
@@ -420,18 +192,6 @@ def gen_block_pattern(layout: torch.Tensor, block_size: int = 64,
 
 def layout_to_causal_mask(layout: torch.Tensor, block_size: int,
                           dtype: torch.dtype = torch.bool) -> torch.Tensor:
-    """
-    Convert block layout to causal token-level mask.
-
-    Applies causal constraint (k_idx <= q_idx) to the expanded pattern.
-
-    Args:
-        layout: Block-level layout [L, H, QB, KB].
-        block_size: Number of tokens per block.
-
-    Returns:
-        Causal token-level mask [L, H, QB*block_size, KB*block_size].
-    """
     L, H, QB, KB = layout.shape
     full = gen_block_pattern(layout, block_size, dtype)
     causal = gen_causal_pattern(QB * block_size, KB * block_size, dtype, L, H)
@@ -442,50 +202,36 @@ def _apply_percentage_control(
     block_precision_map: torch.Tensor,
     percentage: float,
 ) -> torch.Tensor:
-    """
-    Adjust block precision map to achieve target INT8 percentage.
-
-    Randomly flips high-precision blocks to low-precision until
-    the target percentage is reached.
-
-    Args:
-        block_precision_map: Block-level mask [num_m, num_n].
-            True = INT8, False = FP16.
-        percentage: Target fraction of blocks using INT8 (0.0-1.0).
-
-    Returns:
-        Adjusted block precision map.
-    """
     if percentage is None or percentage < 0.0 or percentage > 1.0:
         return block_precision_map
-    
+
     num_m, num_n = block_precision_map.shape
     total_blocks = num_m * num_n
-    
+
     current_low_prec = block_precision_map.sum().item()
     target_low_prec = int(total_blocks * percentage)
-    
+
     if current_low_prec >= target_low_prec:
         return block_precision_map
-    
+
     num_to_flip = target_low_prec - current_low_prec
-    
+
     high_prec_mask = ~block_precision_map
     high_prec_indices = torch.nonzero(high_prec_mask, as_tuple=False)
-    
+
     if len(high_prec_indices) == 0:
         return block_precision_map
-    
+
     if num_to_flip > len(high_prec_indices):
         num_to_flip = len(high_prec_indices)
-    
+
     perm = torch.randperm(len(high_prec_indices), device=block_precision_map.device)
     selected_indices = high_prec_indices[perm[:num_to_flip]]
-    
+
     result = block_precision_map.clone()
     for idx in selected_indices:
         result[idx[0], idx[1]] = True
-    
+
     return result
 
 
@@ -497,7 +243,6 @@ def _causal_compute_tile_weights(
     *,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    """Count causally executed compute tiles represented by each mask bit."""
     if block_n_mask % compute_block_n != 0:
         raise ValueError(
             f"block_n_mask ({block_n_mask}) must be a multiple of "
@@ -532,7 +277,6 @@ def _retarget_weighted_int8_fraction(
     *,
     seed: int = 42,
 ) -> torch.Tensor:
-    """Retarget INT8 assignments over weighted executable tiles only."""
     if percentage < 0.0 or percentage > 1.0:
         raise ValueError(f"percentage must be in [0, 1], got {percentage}")
     if block_precision_map.shape != weights.shape:
@@ -592,7 +336,6 @@ def _make_sptrans_block_precision_map(
     *,
     device: torch.device | None = None,
 ) -> torch.Tensor:
-    """Construct SpTrans routing with percentage over causal compute tiles."""
     num_m = (seq_len + block_m - 1) // block_m
     num_n = (seq_len + block_n_mask - 1) // block_n_mask
     sparse = torch.ones((num_m, num_n), dtype=torch.bool, device=device)
@@ -643,7 +386,6 @@ def _make_sptrans_block_precision_map(
 
 
 def pack_block_precision_map(block_precision_map: torch.Tensor) -> torch.Tensor:
-    """Pack at most 64 boolean columns per row without signed-int overflow."""
     if block_precision_map.ndim != 2 or block_precision_map.shape[1] > 64:
         raise ValueError(
             "block_precision_map must be 2D with at most 64 columns, got "
@@ -669,37 +411,6 @@ def make_precision_bitmask(
     pattern_params: dict = None,
     COMPUTE_BLOCK_N: int = None,
 ) -> torch.Tensor:
-    """
-    Convert token-level attention mask to packed block-level precision bitmask.
-
-    Process:
-    1. Extract 2D mask from token_mask[0, 0].
-    2. Pad to block boundaries.
-    3. Reduce each block to boolean (True if block contains any important tokens).
-    4. Apply percentage control for percentage-aware patterns.
-    5. Pack each row into uint64 bitmask (bit=1 for INT8 blocks).
-
-    Args:
-        seq_len: Sequence length in tokens.
-        BLOCK_M: Query block size.
-        BLOCK_N: Key block size.
-        token_mask: Token-level mask [1, 1, Q, K] or [L, H, Q, K].
-            May be ``None`` for the specialized percentage-aware SpTrans
-            constructor, which works directly at block granularity.
-        percentage: Target INT8 percentage (for percentage-aware patterns).
-        pattern_type: Pattern identifier for special handling.
-        pattern_params: Pattern-specific parameters.
-        COMPUTE_BLOCK_N: K/V tile width used by the attention kernel.  This is
-            required to target percentages over executed compute tiles when it
-            differs from the packed-mask block width.
-
-    Returns:
-        Packed bitmask tensor [num_m] of dtype uint64.
-        Each uint64 encodes one row of blocks (max 64 blocks per row).
-
-    Raises:
-        ValueError: If num_n > 64 (exceeds uint64 capacity).
-    """
     num_m = (seq_len + BLOCK_M - 1) // BLOCK_M
     num_n = (seq_len + BLOCK_N - 1) // BLOCK_N
     if COMPUTE_BLOCK_N is None:
@@ -786,7 +497,7 @@ def make_precision_bitmask(
         if target_band_blocks % 2 == 0:
             target_band_blocks = max(1, target_band_blocks - 1)
         target_band_blocks = max(1, min(target_band_blocks, num_n))
-        
+
         sparse = torch.ones((num_m, num_n), dtype=torch.bool, device=mask2d.device)
         for i in range(num_m):
             center = i
@@ -796,7 +507,7 @@ def make_precision_bitmask(
     elif pattern_type == "global" and percentage is not None and pattern_params is not None:
         target_global_block_cols = int(round(num_n * (1.0 - percentage)))
         target_global_block_cols = max(1, min(target_global_block_cols, num_n))
-        
+
         key_pos = pattern_params.get("key_pos", list(range(min(4, seq_len))))
         global_block_cols = set()
         for pos in key_pos:
@@ -804,15 +515,15 @@ def make_precision_bitmask(
                 block_col = pos // BLOCK_N
                 if block_col < num_n:
                     global_block_cols.add(block_col)
-        
+
         while len(global_block_cols) < target_global_block_cols and len(global_block_cols) < num_n:
             for col in range(num_n):
                 if col not in global_block_cols:
                     global_block_cols.add(col)
                     break
-        
+
         global_block_cols = sorted(list(global_block_cols))[:target_global_block_cols]
-        
+
         sparse = torch.ones((num_m, num_n), dtype=torch.bool, device=mask2d.device)
         for i in range(num_m):
             for block_col in global_block_cols:
@@ -821,7 +532,7 @@ def make_precision_bitmask(
     elif pattern_type == "row_rand" and percentage is not None and pattern_params is not None:
         target_rand_blocks_per_row = int(round(num_n * (1.0 - percentage)))
         target_rand_blocks_per_row = max(1, min(target_rand_blocks_per_row, num_n))
-        
+
         sparse = torch.ones((num_m, num_n), dtype=torch.bool, device=mask2d.device)
         torch.manual_seed(42)
         for i in range(num_m):
@@ -830,7 +541,7 @@ def make_precision_bitmask(
     elif pattern_type == "align_sparse" and percentage is not None and pattern_params is not None:
         target_aligned_blocks_per_row = int(round(num_n * (1.0 - percentage)))
         target_aligned_blocks_per_row = max(1, min(target_aligned_blocks_per_row, num_n))
-        
+
         sparse = torch.ones((num_m, num_n), dtype=torch.bool, device=mask2d.device)
         for i in range(num_m):
             start_block = max(0, num_n - target_aligned_blocks_per_row)
@@ -838,39 +549,39 @@ def make_precision_bitmask(
     elif pattern_type == "bigbird" and percentage is not None and pattern_params is not None:
         target_high_precision_blocks = int(round(num_m * num_n * (1.0 - percentage)))
         target_high_precision_blocks = max(1, min(target_high_precision_blocks, num_m * num_n))
-        
+
         sparse = torch.ones((num_m, num_n), dtype=torch.bool, device=mask2d.device)
-        
+
         num_band_block = pattern_params.get("num_band_block", 3)
         num_global_block = pattern_params.get("num_global_block", 2)
         num_rand_block = pattern_params.get("num_rand_block", 3)
-        
+
         target_band_blocks_per_row = int(round(num_n * (1.0 - percentage) * 0.5))
         target_band_blocks_per_row = max(1, min(target_band_blocks_per_row, num_n))
         band_width_blocks = target_band_blocks_per_row
         if band_width_blocks % 2 == 0:
             band_width_blocks += 1
         band_width_blocks = min(band_width_blocks, num_n)
-        
+
         for i in range(num_m):
             center_col = min(i, num_n - 1)
             start_block = max(0, center_col - band_width_blocks // 2)
             end_block = min(num_n, center_col + band_width_blocks // 2 + 1)
             sparse[i, start_block:end_block] = False
-        
+
         num_global_blocks = min(num_global_block, num_n)
         global_block_cols = list(range(0, num_global_blocks))
         for col in global_block_cols:
             sparse[:, col] = False
             if col < num_m:
                 sparse[col, :] = False
-        
+
         num_rand_blocks_per_row = min(num_rand_block, num_n)
         torch.manual_seed(42)
         for i in range(num_m):
             rand_indices = torch.randperm(num_n, device=mask2d.device)[:num_rand_blocks_per_row]
             sparse[i, rand_indices] = False
-        
+
         current_high_precision = (~sparse).sum().item()
         if current_high_precision < target_high_precision_blocks:
             low_precision_indices = torch.nonzero(sparse, as_tuple=False)
@@ -893,7 +604,7 @@ def make_precision_bitmask(
             sparse = tiles.any(dim=(2, 3))
         else:
             sparse = (~tiles).any(dim=(2, 3))
-        
+
         if percentage is not None and pattern_type not in ["one", "causal"]:
             sparse = _apply_percentage_control(sparse, percentage)
 
@@ -908,12 +619,6 @@ def make_precision_bitmask(
             "bigbird",
         }
     ):
-        # Percentage-aware policies must be matched over work the causal
-        # kernel actually visits.  Counting the full square routes mostly
-        # masked future groups at long context and makes labels such as "50%"
-        # scientifically misleading.  Retarget only after constructing the
-        # policy-specific topology so the original placement remains the
-        # starting point; seed 42 matches the repository's random layouts.
         weights = _causal_compute_tile_weights(
             seq_len,
             BLOCK_M,
@@ -929,5 +634,3 @@ def make_precision_bitmask(
         )
 
     return pack_block_precision_map(sparse)
-
-

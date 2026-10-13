@@ -1,4 +1,3 @@
-"""Minimal Hugging Face Qwen2 example for TileMix."""
 from pathlib import Path
 import argparse
 import sys
@@ -8,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.tilemix_qwen import (  # noqa: E402
+from models.tilemix_qwen import (
     configure_tilemix_attention_pattern,
     inject_tilemix_into_qwen,
 )

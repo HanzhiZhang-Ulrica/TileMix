@@ -47,8 +47,6 @@ def quant_per_block_int8_kernel(Input, Output, Scale,
 
 def per_block_int8_single(
         x, cu_seqlens_x, max_seqlen_x, BLK=128, sm_scale=1.0):
-    """Quantize a varlen tensor to int8 with per-block scales."""
-
     x_int8 = torch.empty(x.shape, dtype=torch.int8, device=x.device)
 
     h = x.shape[1]
@@ -88,7 +86,7 @@ def per_block_int8(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
         q_sm_scale = 1.0
     else:
         q_sm_scale = sm_scale * 1.44269504
-    
+
     q_int8, q_scale, cu_seqlens_q_scale = per_block_int8_single(
         q,
         cu_seqlens_q,
@@ -106,4 +104,3 @@ def per_block_int8(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
     )
 
     return q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale
-

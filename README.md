@@ -10,7 +10,12 @@ This repository contains the implementation accompanying **“TileMix: Tile-Cent
 
 ## Usage
 
-Use a CUDA-enabled environment with PyTorch, Triton, and Hugging Face Transformers. Run the following commands from the repository root.
+Use Python 3.12 and a CUDA-enabled environment. For the prefill benchmark, install the CUDA 12.9 toolkit and GCC 14, with `nvcc`, the compiler, and Ninja on `PATH`, and set `CUDA_HOME` to the toolkit directory. Run the following commands from the repository root.
+
+```bash
+python -m pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install triton==3.5.0 transformers==4.57.1 accelerate==1.11.0 ninja
+```
 
 ### LLaMA
 
@@ -36,6 +41,17 @@ model = configure_tilemix_attention_pattern(
     percentage=0.50,
 )
 ```
+
+### Prefill benchmark
+
+```bash
+python examples/benchmark_prefill.py \
+  --model meta-llama/Llama-3.2-3B-Instruct \
+  --batch-size 8 \
+  --input-length 4096
+```
+
+The command runs FP16 LLaMA with SpTrans50, a KV cache, and last-position logits. It reports the median of 20 CUDA-event measurements after 5 warmups; loading, tokenization, compilation, and decoding are excluded. `--model` also accepts a local checkpoint directory.
 
 ### Qwen
 
